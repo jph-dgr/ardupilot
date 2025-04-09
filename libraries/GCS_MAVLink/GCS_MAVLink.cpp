@@ -30,6 +30,10 @@ This provides some support code and variables for MAVLink enabled sketches
 #include <AP_Common/AP_Common.h>
 #include <AP_HAL/AP_HAL.h>
 
+extern "C" {
+    #include "aes.h"
+}
+
 extern const AP_HAL::HAL& hal;
 
 #ifdef MAVLINK_SEPARATE_HELPERS
@@ -132,29 +136,73 @@ uint16_t comm_get_txspace(mavlink_channel_t chan)
  */
 void comm_send_buffer(mavlink_channel_t chan, const uint8_t *buf, uint8_t len)
 {
-    if (!valid_channel(chan) || mavlink_comm_port[chan] == nullptr || chan_discard[chan]) {
-        return;
-    }
+	if (!valid_channel(chan) || mavlink_comm_port[chan] == nullptr || chan_discard[chan]) {
+    	return;
+	}
+
 #if HAL_HIGH_LATENCY2_ENABLED
-    // if it's a disabled high latency channel, don't send
-    GCS_MAVLINK *link = gcs().chan(chan);
-    if (link->is_high_latency_link && !gcs().get_high_latency_status()) {
-        return;
-    }
+	// if it's a disabled high latency channel, don't send
+	GCS_MAVLINK *link = gcs().chan(chan);
+	if (link->is_high_latency_link && !gcs().get_high_latency_status()) {
+    	return;
+	}
 #endif
-    if (gcs_alternative_active[chan]) {
-        // an alternative protocol is active
-        return;
-    }
-    const size_t written = mavlink_comm_port[chan]->write(buf, len);
+
+	if (gcs_alternative_active[chan]) {
+    	// an alternative protocol is active
+    	return;
+	}
+
+	// -------------------------------
+	// Cifrado AES-128 CBC
+	// -------------------------------
+
+	// Longitud con padding para AES (múltiplo de 16)
+	uint8_t padded_len = len;
+	if (padded_len % 16 != 0) {
+    	padded_len = ((padded_len / 16) + 1) * 16;
+	}
+
+	// Buffer de salida con padding cero
+	uint8_t encrypted_buf[256] = {0};
+	memcpy(encrypted_buf, buf, len);  // Copiamos el mensaje original
+
+	// Clave AES de 128 bits
+	uint8_t key[16] = {
+    	0x00, 0x01, 0x02, 0x03,
+    	0x04, 0x05, 0x06, 0x07,
+    	0x08, 0x09, 0x0A, 0x0B,
+    	0x0C, 0x0D, 0x0E, 0x0F
+	};
+
+	// Vector de inicialización (IV)
+	uint8_t iv[16] = {
+    	0xA0, 0xA1, 0xA2, 0xA3,
+    	0xA4, 0xA5, 0xA6, 0xA7,
+    	0xA8, 0xA9, 0xAA, 0xAB,
+    	0xAC, 0xAD, 0xAE, 0xAF
+	};
+
+	// Inicializar contexto AES y cifrar en modo CBC
+	struct AES_ctx ctx;
+	AES_init_ctx_iv(&ctx, key, iv);
+	AES_CBC_encrypt_buffer(&ctx, encrypted_buf, padded_len);
+
+	// -------------------------------
+	// Enviar buffer cifrado
+	// -------------------------------
+
+	const size_t written = mavlink_comm_port[chan]->write(encrypted_buf, padded_len);
+
 #if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    if (written < len && !mavlink_comm_port[chan]->is_write_locked()) {
-        AP_HAL::panic("Short write on UART: %lu < %u", (unsigned long)written, len);
-    }
+	if (written < padded_len && !mavlink_comm_port[chan]->is_write_locked()) {
+    	AP_HAL::panic("Short write on UART: %lu < %u", (unsigned long)written, padded_len);
+	}
 #else
-    (void)written;
+	(void)written;
 #endif
 }
+
 
 /*
   lock a channel for send
@@ -192,3 +240,4 @@ HAL_Semaphore &comm_chan_lock(mavlink_channel_t chan)
 }
 
 #endif  // HAL_GCS_ENABLED
+#include "aes.c"
